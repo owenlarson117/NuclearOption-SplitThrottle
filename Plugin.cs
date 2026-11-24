@@ -7,12 +7,11 @@ using BepInEx;
 using BepInEx.Configuration;
 using BepInEx.Logging;
 using HarmonyLib;
-using InputFramework;
 using Rewired;
 using UnityEngine;
+using TMPro;
 
 [BepInPlugin("com.noms.splitthrottle", "SplitThrottle", "1.3.0")]
-[BepInDependency("experimental.assassin1076.extrainputframework", BepInDependency.DependencyFlags.HardDependency)]
 public class Plugin : BaseUnityPlugin
 {
     // === Rewired Action Names ===
@@ -40,6 +39,13 @@ public class Plugin : BaseUnityPlugin
     internal static ConfigEntry<bool> cfgInvertRight;
     internal static ConfigEntry<string> cfgControllerName;
     internal static ConfigEntry<string> cfgDisabledAircraft;
+    internal static ConfigEntry<bool> cfgHudReadout;
+    internal static ConfigEntry<float> cfgHudOffsetX;
+    internal static ConfigEntry<float> cfgHudOffsetY;
+    internal static ConfigEntry<bool> cfgDualGauges;
+    internal static ConfigEntry<string> cfgDualLayout;
+    internal static ConfigEntry<float> cfgOuterScale;
+    internal static ConfigEntry<KeyboardShortcut> keyLeftUp, keyLeftDown, keyRightUp, keyRightDown, keySync;
 
     internal static HashSet<string> disabledNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
@@ -48,6 +54,19 @@ public class Plugin : BaseUnityPlugin
     internal static readonly Dictionary<DuctedFan, EngineSide> ductedFanSideCache = new Dictionary<DuctedFan, EngineSide>();
 
     internal enum EngineSide { Left, Right, Center }
+
+    // Which engine sides the local aircraft actually has (filled in by the engine patches).
+    internal static Aircraft sideAircraft;
+    internal static bool hasLeftEngine, hasRightEngine;
+
+    internal static void MarkSide(Aircraft ac, EngineSide side)
+    {
+        if (ac != sideAircraft) { sideAircraft = ac; hasLeftEngine = hasRightEngine = false; }
+        if (side == EngineSide.Left) hasLeftEngine = true;
+        else if (side == EngineSide.Right) hasRightEngine = true;
+    }
+
+    internal static bool LocalIsTwin(Aircraft ac) => ac != null && ac == sideAircraft && hasLeftEngine && hasRightEngine;
 
     void Awake()
     {
@@ -58,7 +77,21 @@ public class Plugin : BaseUnityPlugin
             "Throttle change per frame when holding keyboard key. ConfigurationManager " +
             "UI clamps to 0.01 minimum — for slower ramps, edit this .cfg in Notepad " +
             "directly (e.g. 0.005). Range is internally unrestricted.");
-        cfgShowOverlay = Config.Bind("General", "ShowOverlay", false, "Show throttle overlay on screen");
+        cfgShowOverlay = Config.Bind("General", "ShowOverlay", false, "Show the old standalone (grey box) throttle overlay on screen");
+        cfgHudReadout = Config.Bind("HUD", "ShowSplitReadout", true,
+            "Show 'L xx%  R xx%' under the game's own HUD throttle gauge while split throttle is active");
+        cfgHudOffsetX = Config.Bind("HUD", "ReadoutOffsetX", 0f, "Horizontal nudge for the L/R readout (HUD pixels, + = right)");
+        cfgHudOffsetY = Config.Bind("HUD", "ReadoutOffsetY", 0f, "Vertical nudge for the L/R readout (HUD pixels, + = up)");
+        cfgDualGauges = Config.Bind("HUD", "DualGauges", true,
+            "On twin-engine aircraft, show two separate HUD throttle gauges (one per engine) instead of one");
+        cfgDualLayout = Config.Bind("HUD", "DualGaugeLayout", "Outer",
+            new ConfigDescription("Mirror = left-engine gauge mirrored onto the left side of the HUD. " +
+                "Outer = right-engine gauge drawn as a second arc just outside the normal one.",
+                new AcceptableValueList<string>("Mirror", "Outer")));
+        cfgOuterScale = Config.Bind("HUD", "OuterGaugeScale", 1.25f,
+            new ConfigDescription("Outer layout: size of the right-engine arc relative to the normal gauge. " +
+                "Raise it if the inner gauge's pointer line overlaps the outer arc. Changes apply live.",
+                new AcceptableValueRange<float>(1.05f, 1.8f)));
         cfgDisabledAircraft = Config.Bind("General", "DisabledAircraft", "Chicane,SAH,AttackHelo,Tarantula,Ibis",
             "Comma-separated aircraft names where split throttle is disabled (partial match, case-insensitive)");
 
@@ -74,14 +107,12 @@ public class Plugin : BaseUnityPlugin
         ParseBlacklist();
         cfgDisabledAircraft.SettingChanged += (_, __) => ParseBlacklist();
 
-        // Register Rewired actions via Extra Input Framework
-        ExtraInputManager.RegisterAction(ACT_LEFT_UP, InputActionType.Button);
-        ExtraInputManager.RegisterAction(ACT_LEFT_DOWN, InputActionType.Button);
-        ExtraInputManager.RegisterAction(ACT_RIGHT_UP, InputActionType.Button);
-        ExtraInputManager.RegisterAction(ACT_RIGHT_DOWN, InputActionType.Button);
-        ExtraInputManager.RegisterAction(ACT_SYNC, InputActionType.Button);
-        ExtraInputManager.RegisterAction(ACT_LEFT_AXIS, InputActionType.Axis);
-        ExtraInputManager.RegisterAction(ACT_RIGHT_AXIS, InputActionType.Axis);
+        // Keybinds (replaces Extra Input Framework / Rewired actions)
+        keyLeftUp = Config.Bind("Keybinds", "LeftUp", new KeyboardShortcut(KeyCode.None), "Hold to increase left engine throttle");
+        keyLeftDown = Config.Bind("Keybinds", "LeftDown", new KeyboardShortcut(KeyCode.None), "Hold to decrease left engine throttle");
+        keyRightUp = Config.Bind("Keybinds", "RightUp", new KeyboardShortcut(KeyCode.None), "Hold to increase right engine throttle");
+        keyRightDown = Config.Bind("Keybinds", "RightDown", new KeyboardShortcut(KeyCode.None), "Hold to decrease right engine throttle");
+        keySync = Config.Bind("Keybinds", "Sync", new KeyboardShortcut(KeyCode.None), "Press to sync both engines to the current main throttle");
 
         try
         {
@@ -179,6 +210,7 @@ public class Plugin : BaseUnityPlugin
                      : localPos.x < 0 ? EngineSide.Left : EngineSide.Right;
                 turbojetSideCache[__instance] = side;
             }
+            MarkSide(aircraft, side);
             inputs.throttle = side switch
             {
                 EngineSide.Left => leftThrottle,
@@ -225,6 +257,7 @@ public class Plugin : BaseUnityPlugin
                      : localPos.x < 0 ? EngineSide.Left : EngineSide.Right;
                 ductedFanSideCache[__instance] = side;
             }
+            MarkSide(aircraft, side);
             if (side != EngineSide.Center)
                 inputs.throttle = side == EngineSide.Left ? leftThrottle : rightThrottle;
         }
@@ -259,6 +292,7 @@ public class Plugin : BaseUnityPlugin
             if (inputs == null) return;
 
             Vector3 localPos = ((Component)aircraft).transform.InverseTransformPoint(__instance.transform.position);
+            MarkSide(aircraft, localPos.x < -0.5f ? EngineSide.Left : localPos.x > 0.5f ? EngineSide.Right : EngineSide.Center);
             if (localPos.x < -0.5f) inputs.throttle = leftThrottle;
             else if (localPos.x > 0.5f) inputs.throttle = rightThrottle;
             else inputs.throttle = (leftThrottle + rightThrottle) * 0.5f;
@@ -294,6 +328,7 @@ public class Plugin : BaseUnityPlugin
             if (inputs == null) return;
 
             Vector3 localPos = ((Component)aircraft).transform.InverseTransformPoint(((Component)__instance).transform.position);
+            MarkSide(aircraft, localPos.x < -0.5f ? EngineSide.Left : localPos.x > 0.5f ? EngineSide.Right : EngineSide.Center);
             if (localPos.x < -0.5f) inputs.throttle = leftThrottle;
             else if (localPos.x > 0.5f) inputs.throttle = rightThrottle;
             else inputs.throttle = (leftThrottle + rightThrottle) * 0.5f;
@@ -310,6 +345,282 @@ public class Plugin : BaseUnityPlugin
             if (inputs == null) return;
             inputs.throttle = (leftThrottle + rightThrottle) * 0.5f;
         }
+    }
+
+    // === HUD integration ===
+    // The game's ThrottleGauge reads ControlInputs.throttle during HUDAppManager.Update, after the
+    // player's bound throttle axis has already overwritten it (so it showed only the left lever).
+    //  - Twin-engine + DualGauges: the gauge is cloned; each copy gets its own private ControlInputs
+    //    fed from one engine's split throttle, so both are real game gauges (arc, colours, AB band).
+    //  - Otherwise: the single gauge shows the combined throttle, with an "L xx%  R xx%" readout.
+    [HarmonyPatch(typeof(ThrottleGauge), "Refresh")]
+    internal static class ThrottleGaugePatch
+    {
+        static readonly FieldInfo f_inputs = AccessTools.Field(typeof(ThrottleGauge), "inputs");
+        static readonly FieldInfo f_aircraft = AccessTools.Field(typeof(ThrottleGauge), "aircraft");
+        static readonly FieldInfo f_reading = AccessTools.Field(typeof(ThrottleGauge), "throttleReading");
+        static readonly FieldInfo f_label = AccessTools.Field(typeof(ThrottleGauge), "throttleLabel");
+        static readonly FieldInfo f_pivot = AccessTools.Field(typeof(ThrottleGauge), "throttleReadingPivot");
+        static readonly FieldInfo f_prev = AccessTools.Field(typeof(ThrottleGauge), "throttlePrev");
+        static readonly FieldInfo f_gradient = AccessTools.Field(typeof(ThrottleGauge), "greenToOrangeGradient");
+        static readonly FieldInfo f_fontSize = AccessTools.Field(typeof(HUDApp), "fontSize");
+        static readonly FieldInfo f_fontMul = AccessTools.Field(typeof(HUDApp), "fontSizeMultiplier");
+        static readonly FieldInfo f_regions = AccessTools.Field(typeof(ThrottleGauge), "throttleRegions");
+        static readonly Type t_region = AccessTools.Inner(typeof(ThrottleGauge), "ThrottleRegion");
+        static readonly FieldInfo f_rName = AccessTools.Field(t_region, "name");
+        static readonly FieldInfo f_rShowName = AccessTools.Field(t_region, "showName");
+        static readonly FieldInfo f_rShowPct = AccessTools.Field(t_region, "showPercent");
+        static readonly FieldInfo f_rStart = AccessTools.Field(t_region, "start");
+        static readonly FieldInfo f_rEnd = AccessTools.Field(t_region, "end");
+
+        class GaugeState
+        {
+            public TextMeshProUGUI readout;      // L/R text (single-gauge mode)
+            public ThrottleGauge clone;          // second gauge (dual mode)
+            public string cloneLayout;
+            public ControlInputs mainInputs = new ControlInputs();
+            public ControlInputs cloneInputs = new ControlInputs();
+            public string labelText, cloneLabelText;
+            public bool dual;
+            public float appliedScale = float.NaN;
+        }
+
+        static readonly Dictionary<ThrottleGauge, GaugeState> states = new Dictionary<ThrottleGauge, GaugeState>();
+        static readonly HashSet<ThrottleGauge> clones = new HashSet<ThrottleGauge>();
+        static bool driving; // re-entry guard while we refresh the clone
+
+        internal static void Forget(ThrottleGauge g)
+        {
+            states.Remove(g);
+            clones.Remove(g);
+        }
+
+        static bool IsLocal(ThrottleGauge g, out Aircraft ac)
+        {
+            ac = f_aircraft.GetValue(g) as Aircraft;
+            return ac != null && ac == GetLocalAircraft();
+        }
+
+        static GaugeState State(ThrottleGauge g)
+        {
+            if (!states.TryGetValue(g, out var st)) { st = new GaugeState(); states[g] = st; }
+            return st;
+        }
+
+        static void Prefix(ThrottleGauge __instance)
+        {
+            if (driving || clones.Contains(__instance)) return; // clone is driven from the original's postfix
+            try
+            {
+                bool local = IsLocal(__instance, out var ac);
+                var st = State(__instance);
+                bool active = local && splitActive && cfgEnabled.Value;
+                bool dual = active && cfgDualGauges.Value && LocalIsTwin(ac);
+
+                if (dual)
+                {
+                    bool mirror = cfgDualLayout.Value != "Outer";
+                    if (st.clone == null || st.cloneLayout != cfgDualLayout.Value)
+                        CreateClone(__instance, ac, st, mirror);
+                    if (!st.clone.gameObject.activeSelf) st.clone.gameObject.SetActive(true);
+                    ApplyLayout(__instance, st, mirror);
+
+                    // Mirror: original (right side of HUD) = right engine, mirrored clone = left.
+                    // Outer:  original (inner arc) = left engine, outer clone = right.
+                    st.mainInputs.throttle = mirror ? rightThrottle : leftThrottle;
+                    st.cloneInputs.throttle = mirror ? leftThrottle : rightThrottle;
+                    if (!st.dual) { f_inputs.SetValue(__instance, st.mainInputs); ForceRedraw(__instance); }
+                    SetLabel(__instance, ref st.labelText, mirror ? "R" : "L");
+                    st.dual = true;
+                }
+                else
+                {
+                    if (st.dual) // leave dual mode: give the gauge back the aircraft's real inputs
+                    {
+                        if (ac != null) f_inputs.SetValue(__instance, ac.GetInputs());
+                        RestoreLabel(__instance, st.labelText);
+                        ForceRedraw(__instance);
+                        st.dual = false;
+                    }
+                    if (st.clone != null && st.clone.gameObject.activeSelf) st.clone.gameObject.SetActive(false);
+                    if (active && f_inputs.GetValue(__instance) is ControlInputs inputs)
+                        inputs.throttle = (leftThrottle + rightThrottle) * 0.5f;
+                }
+            }
+            catch (Exception e) { Log?.LogWarning($"HUD gauge prefix error: {e.Message}"); }
+        }
+
+        static void Postfix(ThrottleGauge __instance)
+        {
+            if (driving || clones.Contains(__instance)) return;
+            try
+            {
+                var st = State(__instance);
+                if (st.dual && st.clone != null)
+                {
+                    // The clone stays in `clones`, so our patches skip it and only the game's own
+                    // Refresh runs on it. (Taking it out of the set made the clone clone itself
+                    // recursively -> stack overflow -> hard crash on spawn.)
+                    driving = true;
+                    try { st.clone.Refresh(); } finally { driving = false; }
+                    FixMirroredText(st.clone);
+                    SetLabel(st.clone, ref st.cloneLabelText, cfgDualLayout.Value != "Outer" ? "L" : "R");
+                }
+                UpdateReadout(__instance, st, !st.dual);
+            }
+            catch (Exception e) { Log?.LogWarning($"HUD gauge postfix error: {e.Message}"); }
+        }
+
+        static void ForceRedraw(ThrottleGauge g) => f_prev.SetValue(g, -1f);
+
+        // Size/place the clone; re-run whenever OuterGaugeScale changes so it can be tuned live.
+        static void ApplyLayout(ThrottleGauge original, GaugeState st, bool mirror)
+        {
+            float scale = mirror ? 1f : cfgOuterScale.Value;
+            if (st.appliedScale == scale) return;
+            st.appliedScale = scale;
+
+            var t = st.clone.transform;
+            t.localPosition = original.transform.localPosition;
+            t.localRotation = original.transform.localRotation;
+            Vector3 sc = original.transform.localScale;
+            t.localScale = mirror ? new Vector3(-sc.x, sc.y, sc.z) : sc * scale;
+
+            // Keep both arcs centred on the same point (the gauge's rotation pivot).
+            var op = f_pivot.GetValue(original) as Transform;
+            var cp = f_pivot.GetValue(st.clone) as Transform;
+            if (op != null && cp != null) t.position += op.position - cp.position;
+        }
+
+        static void CreateClone(ThrottleGauge original, Aircraft ac, GaugeState st, bool mirror)
+        {
+            if (st.clone != null) { clones.Remove(st.clone); UnityEngine.Object.Destroy(st.clone.gameObject); }
+
+            var go = UnityEngine.Object.Instantiate(original.gameObject, original.transform.parent, false);
+            go.name = "SplitThrottle_SecondGauge";
+            var clone = go.GetComponent<ThrottleGauge>();
+            clones.Add(clone);
+            // Our own L/R readout may have been cloned along with the gauge; remove it.
+            var strayReadout = go.transform.Find("SplitThrottle_LR");
+            if (strayReadout != null) UnityEngine.Object.Destroy(strayReadout.gameObject);
+
+            clone.Initialize(ac);          // sets aircraft, theme hooks, gradient, visibility
+            clone.RefreshSettings();       // fonts
+            f_inputs.SetValue(clone, st.cloneInputs);
+            st.cloneLabelText = null;
+            // the template label may already carry our "L "/"R " prefix
+            if (st.labelText != null && f_label.GetValue(clone) is TextMeshProUGUI cl) cl.text = st.labelText;
+
+            st.clone = clone;
+            st.appliedScale = float.NaN;
+            ApplyLayout(original, st, mirror);
+            st.cloneLayout = cfgDualLayout.Value;
+            ForceRedraw(clone);
+        }
+
+        // A mirrored parent would render the clone's text backwards; flip the text objects back.
+        static void FixMirroredText(ThrottleGauge clone)
+        {
+            if (clone.transform.localScale.x >= 0) return;
+            foreach (var f in new[] { f_reading, f_label })
+            {
+                if (f.GetValue(clone) is TextMeshProUGUI txt)
+                {
+                    var s = txt.transform.localScale;
+                    if (s.x > 0) txt.transform.localScale = new Vector3(-s.x, s.y, s.z);
+                }
+            }
+        }
+
+        static void SetLabel(ThrottleGauge g, ref string original, string side)
+        {
+            if (!(f_label.GetValue(g) is TextMeshProUGUI lbl)) return;
+            if (original == null) original = lbl.text;
+            string want = $"{side} {original}";
+            if (lbl.text != want) lbl.text = want;
+        }
+
+        static void RestoreLabel(ThrottleGauge g, string original)
+        {
+            if (original != null && f_label.GetValue(g) is TextMeshProUGUI lbl) lbl.text = original;
+        }
+
+        static void UpdateReadout(ThrottleGauge gauge, GaugeState st, bool showWanted)
+        {
+            var reading = f_reading.GetValue(gauge) as TextMeshProUGUI;
+            bool want = showWanted && splitActive && cfgEnabled.Value && cfgHudReadout.Value
+                        && IsLocal(gauge, out _) && reading != null && reading.enabled;
+            if (!want)
+            {
+                if (st.readout != null) st.readout.gameObject.SetActive(false);
+                return;
+            }
+            if (st.readout == null) st.readout = CreateLabel(gauge, reading);
+            if (!st.readout.gameObject.activeSelf) st.readout.gameObject.SetActive(true);
+
+            // Directly under the gauge's own % reading (it slides along the arc with throttle).
+            int fs = (int)f_fontSize.GetValue(gauge);
+            float mul = (float)f_fontMul.GetValue(gauge);
+            st.readout.fontSize = Mathf.Max(8, (int)((fs - 2) * mul));
+            Vector3 basePos = gauge.transform.InverseTransformPoint(reading.transform.position);
+            st.readout.rectTransform.localPosition = basePos
+                + new Vector3(cfgHudOffsetX.Value, -st.readout.fontSize * 1.3f + cfgHudOffsetY.Value, 0f);
+            st.readout.rectTransform.localRotation = Quaternion.identity;
+
+            var grad = f_gradient.GetValue(gauge) as Gradient;
+            var regions = f_regions.GetValue(gauge) as Array;
+            st.readout.text = $"{Part("L", leftThrottle, grad, regions)}   {Part("R", rightThrottle, grad, regions)}";
+        }
+
+        // Mirrors ThrottleGauge's own text: inside one of the gauge's throttle regions
+        // (e.g. the afterburner band) show that region's name / in-region percent.
+        static string Part(string side, float v, Gradient g, Array regions)
+        {
+            Color c = g != null ? g.Evaluate(v) : Color.green;
+            string txt = $"{v * 100f:0}%";
+            if (regions != null)
+            {
+                foreach (var r in regions)
+                {
+                    if (r == null) continue;
+                    float start = (float)f_rStart.GetValue(r), end = (float)f_rEnd.GetValue(r);
+                    if (v < start || v > end) continue;
+                    string t = "";
+                    if ((bool)f_rShowName.GetValue(r)) t = (string)f_rName.GetValue(r) ?? "";
+                    if ((bool)f_rShowPct.GetValue(r))
+                    {
+                        float pct = end - start > 0f ? (v - start) / (end - start) : 1f;
+                        t += (t.Length > 0 ? " " : "") + $"{pct * 100f:0}%";
+                    }
+                    if (t.Length > 0) txt = t;
+                }
+            }
+            return $"<color=#{ColorUtility.ToHtmlStringRGB(c)}>{side} {txt}</color>";
+        }
+
+        static TextMeshProUGUI CreateLabel(ThrottleGauge gauge, TextMeshProUGUI template)
+        {
+            var go = UnityEngine.Object.Instantiate(template.gameObject, gauge.transform, false);
+            go.name = "SplitThrottle_LR";
+            for (int i = go.transform.childCount - 1; i >= 0; i--)
+                UnityEngine.Object.Destroy(go.transform.GetChild(i).gameObject);
+            var t = go.GetComponent<TextMeshProUGUI>();
+            t.richText = true;
+            t.enableWordWrapping = false;
+            t.overflowMode = TextOverflowModes.Overflow;
+            t.alignment = TextAlignmentOptions.Center;
+            t.color = Color.white;
+            t.rectTransform.pivot = new Vector2(0.5f, 0.5f);
+            t.rectTransform.sizeDelta = new Vector2(200f, t.rectTransform.sizeDelta.y);
+            return t;
+        }
+    }
+
+    // Our clone isn't in HUDAppManager.apps; drop bookkeeping when gauges are destroyed.
+    [HarmonyPatch(typeof(ThrottleGauge), "OnDestroy")]
+    static class ThrottleGaugeDestroyPatch
+    {
+        static void Postfix(ThrottleGauge __instance) => ThrottleGaugePatch.Forget(__instance);
     }
 }
 
@@ -329,6 +640,12 @@ public class SplitThrottleRunner : MonoBehaviour
         }
     }
 
+    static bool Held(ConfigEntry<KeyboardShortcut> e)
+    {
+        var k = e.Value;
+        return k.MainKey != KeyCode.None && k.IsPressed();
+    }
+
     void DoUpdate()
     {
         if (!Plugin.cfgEnabled.Value) return;
@@ -346,27 +663,23 @@ public class SplitThrottleRunner : MonoBehaviour
 
         if (!Plugin.splitActive) return;
 
-        // Rewired button controls
+        // Keyboard controls (BepInEx config hotkeys)
         try
         {
-            var player = ReInput.players.GetPlayer(0);
-            if (player != null)
-            {
-                float step = Plugin.cfgKeyboardStep.Value;
-                if (player.GetButton(Plugin.ACT_LEFT_UP))
-                    Plugin.leftThrottle = Mathf.Clamp01(Plugin.leftThrottle + step);
-                if (player.GetButton(Plugin.ACT_LEFT_DOWN))
-                    Plugin.leftThrottle = Mathf.Clamp01(Plugin.leftThrottle - step);
-                if (player.GetButton(Plugin.ACT_RIGHT_UP))
-                    Plugin.rightThrottle = Mathf.Clamp01(Plugin.rightThrottle + step);
-                if (player.GetButton(Plugin.ACT_RIGHT_DOWN))
-                    Plugin.rightThrottle = Mathf.Clamp01(Plugin.rightThrottle - step);
+            float step = Plugin.cfgKeyboardStep.Value;
+            if (Held(Plugin.keyLeftUp))
+                Plugin.leftThrottle = Mathf.Clamp01(Plugin.leftThrottle + step);
+            if (Held(Plugin.keyLeftDown))
+                Plugin.leftThrottle = Mathf.Clamp01(Plugin.leftThrottle - step);
+            if (Held(Plugin.keyRightUp))
+                Plugin.rightThrottle = Mathf.Clamp01(Plugin.rightThrottle + step);
+            if (Held(Plugin.keyRightDown))
+                Plugin.rightThrottle = Mathf.Clamp01(Plugin.rightThrottle - step);
 
-                if (player.GetButtonDown(Plugin.ACT_SYNC))
-                {
-                    Plugin.leftThrottle = aircraft.GetInputs().throttle;
-                    Plugin.rightThrottle = Plugin.leftThrottle;
-                }
+            if (Plugin.keySync.Value.IsDown())
+            {
+                Plugin.leftThrottle = aircraft.GetInputs().throttle;
+                Plugin.rightThrottle = Plugin.leftThrottle;
             }
         }
         catch { }
